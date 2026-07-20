@@ -201,9 +201,13 @@ class NV_FLCN(NV_IP):
 
     # booter
     self.reset(self.sec2)
+    # DEBUG: log address values
+    import os as _os
+    if int(_os.environ.get("NV_DEBUG", "1")) >= 2:
+        print(f"  DEBUG init_hw: large_bar={self.nvdev.large_bar} vram_nbytes={self.nvdev.vram.nbytes} vram_size={self.nvdev.vram_size} booter_paddr={self.booter_image_paddr:#x} wpr_meta_sysmem={self.nvdev.gsp.wpr_meta_sysmem:#x} wpr_meta_paddr={self.nvdev.gsp.wpr_meta_paddr:#x}", flush=True)
     mbx = self.execute_hs(self.sec2, self.booter_image_paddr, code_off=self.booter_code_off, data_off=self.booter_data_off,
       imemPa=0x0, imemVa=self.booter_code_off, imemSz=self.booter_code_sz, dmemPa=0x0, dmemVa=0x0, dmemSz=self.booter_data_sz,
-      pkc_off=0x10, engid=1, ucodeid=3, mailbox=self.nvdev.gsp.wpr_meta_sysmem)
+      pkc_off=0x10, engid=1, ucodeid=3, mailbox=self.nvdev.gsp.wpr_meta_paddr)
     assert mbx[0] == 0x0, f"Booter failed to execute, mailbox is {mbx[0]:08x}, {mbx[1]:08x}"
 
     self.nvdev.NV_PFALCON_FALCON_OS.with_base(self.falcon).write(0x0)
@@ -236,8 +240,11 @@ class NV_FLCN(NV_IP):
   def execute_hs(self, base, img_paddr, code_off, data_off, imemPa, imemVa, imemSz, dmemPa, dmemVa, dmemSz, pkc_off, engid, ucodeid, mailbox=None):
     self.disable_ctx_req(base)
 
-    # target=0 is FB (not in published headers)
-    self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)[ctx_dma:=0].update(target=0, mem_type=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL)
+    # target=0 is FB (not in published headers); target=1 is COHERENT_SYSMEM.
+    # On small-BAR systems _alloc_boot_mem returns sysmem-backed buffers, so the Falcon
+    # has to DMA from system memory rather than from VRAM through the (too-small) BAR1 window.
+    target = 0 if self.nvdev.large_bar else self.nvdev.NV_PFALCON_FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM
+    self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)[ctx_dma:=0].update(target=target, mem_type=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL)
 
     cmd = self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).encode(write=0, size=self.nvdev.NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B,
       ctxdma=ctx_dma, imem=1, sec=1)
@@ -434,9 +441,19 @@ class NV_GSP(NV_IP):
     self.init_gsp_image()
     self.init_boot_binary_image()
 
-    common = {'sizeOfBootloader':(boot_sz:=len(self.booter_image)), 'sysmemAddrOfBootloader':self.booter_bar1,
-      'sizeOfRadix3Elf':(radix3_sz:=len(self.gsp_image)), 'sysmemAddrOfRadix3Elf': self.gsp_radix3_addrs[0],
-      'sizeOfSignature': 0x1000, 'sysmemAddrOfSignature': self.gsp_signature_bar1,
+    # The SEC2 booter uses FBIF target=0 (FB) for its DMA, which interprets
+    # addresses as VRAM offsets (not GPAs).  Convert the GPA addresses returned
+    # by _alloc_boot_mem (bar1_base + paddr) to VRAM offsets (paddr) so the
+    # booter can read bootloader/radix3/signature via FB DMA correctly.
+    # This only matters on large-BAR systems where boot mem is in VRAM.
+    bar1_base = self.nvdev.pci_dev.bar_info(1)[0]
+    bootloader_vram_off = self.booter_bar1 - bar1_base
+    radix3_vram_off = self.gsp_radix3_addrs[0] - bar1_base
+    sig_vram_off = self.gsp_signature_bar1 - bar1_base
+
+    common = {'sizeOfBootloader':(boot_sz:=len(self.booter_image)), 'sysmemAddrOfBootloader':bootloader_vram_off,
+      'sizeOfRadix3Elf':(radix3_sz:=len(self.gsp_image)), 'sysmemAddrOfRadix3Elf': radix3_vram_off,
+      'sizeOfSignature': 0x1000, 'sysmemAddrOfSignature': sig_vram_off,
       'bootloaderCodeOffset': self.booter_desc.monitorCodeOffset, 'bootloaderDataOffset': self.booter_desc.monitorDataOffset,
       'bootloaderManifestOffset': self.booter_desc.manifestOffset, 'revision':nv.GSP_FW_WPR_META_REVISION, 'magic':nv.GSP_FW_WPR_META_MAGIC}
 
@@ -450,7 +467,7 @@ class NV_GSP(NV_IP):
         gspFwHeapOffset=(gsp_heap_off:=round_down(gsp_off-gsp_heap_sz, 0x100000)), gspFwWprStart=(wpr_st:=round_down(gsp_heap_off-0x1000, 0x100000)),
         nonWprHeapSize=(non_wpr_sz:=0x100000), nonWprHeapOffset=(non_wpr_off:=round_down(wpr_st-non_wpr_sz, 0x100000)), gspFwRsvdStart=non_wpr_off)
       assert self.nvdev.flcn.frts_offset == m.frtsOffset, f"FRTS mismatch: {self.nvdev.flcn.frts_offset} != {m.frtsOffset}"
-    self.wpr_meta, _, wpr_meta_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(type(m)), data=bytes(m))
+    self.wpr_meta, self.wpr_meta_paddr, wpr_meta_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(type(m)), data=bytes(m))
     self.wpr_meta_sysmem = wpr_meta_addrs[0]
 
   def promote_ctx(self, client:int, subdevice:int, obj:int, ctxbufs:dict[int, GRBufDesc], bufs=None, virt=None, phys=None):
