@@ -216,6 +216,10 @@ class NV_FLCN(NV_IP):
 
     # booter
     self.reset(self.sec2)
+    # DEBUG: log address values
+    import os as _os
+    if int(_os.environ.get("NV_DEBUG", "1")) >= 2:
+        print(f"  DEBUG init_hw: large_bar={self.nvdev.large_bar} vram_nbytes={self.nvdev.vram.nbytes} vram_size={self.nvdev.vram_size} booter_paddr={self.booter_image_paddr:#x} wpr_meta_sysmem={self.nvdev.gsp.wpr_meta_sysmem:#x} wpr_meta_paddr={self.nvdev.gsp.wpr_meta_paddr:#x}", flush=True)
     mbx = self.execute_hs(self.sec2, self.booter_image_paddr, code_off=self.booter_code_off, data_off=self.booter_data_off,
       imemPa=0x0, imemVa=self.booter_code_off, imemSz=self.booter_code_sz, dmemPa=0x0, dmemVa=0x0, dmemSz=self.booter_data_sz,
       pkc_off=0x10, engid=1, ucodeid=3, mailbox=(self.nvdev.gsp.wpr_meta_paddr if self.nvdev.large_bar else self.nvdev.gsp.wpr_meta_sysmem))
@@ -252,7 +256,7 @@ class NV_FLCN(NV_IP):
     self.disable_ctx_req(base)
 
     # target=0 is FB (not in published headers); target=1 is COHERENT_SYSMEM.
-    # On small-BAR systems the booter image is in sysmem, so the Falcon
+    # On small-BAR systems _alloc_boot_mem returns sysmem-backed buffers, so the Falcon
     # has to DMA from system memory rather than from VRAM through the (too-small) BAR1 window.
     target = 0 if self.nvdev.large_bar else self.nvdev.NV_PFALCON_FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM
     self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)[ctx_dma:=0].update(target=target, mem_type=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL)
