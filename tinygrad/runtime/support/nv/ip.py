@@ -164,7 +164,7 @@ class NV_FLCN(NV_IP):
       patched_image[(cmd_off:=self.desc_v3.IMEMLoadSize+dmem.cmd_in_buffer_offset) : cmd_off+len(cmd)] = cmd
       patched_image[(sig_off:=self.desc_v3.IMEMLoadSize+self.desc_v3.PKCDataOffset) : sig_off+0x180] = signature[-0x180:]
 
-      return self.nvdev._alloc_boot_mem(len(patched_image), data=patched_image, sysmem=False)
+      return self.nvdev._alloc_boot_mem(len(patched_image), data=patched_image, sysmem=(not self.nvdev.large_bar))
 
     _, self.frts_image_paddr, _ = __patch(0x15, bytes(frts_cmd))
 
@@ -173,18 +173,33 @@ class NV_FLCN(NV_IP):
            "ad102":"8b293e19b637c5e22c87a2428d1c71bb13e0904e8a88ac6b3c6c1f2679c6e37a"}[self.nvdev.fw_name]
     h = nv.struct_nvfw_bin_hdr.from_buffer_copy(b:=fetch_fw(f"nvidia/{self.nvdev.fw_name}/gsp", "booter_load-570.144.bin", sha))
     lh = nv.struct_nvfw_hs_load_header_v2.from_buffer_copy(b, (hs:=nv.struct_nvfw_hs_header_v2.from_buffer_copy(b, h.header_offset)).header_offset)
-    app = nv.struct_nvfw_hs_load_header_v2_app.from_buffer_copy(b, hs.header_offset + ctypes.sizeof(nv.struct_nvfw_hs_load_header_v2))
+
+    # AD104 (ADA) booter has num_apps=0 and uses os_code_offset/os_code_size directly.
+    # GA102 booter has num_apps>=1 and uses the first app entry.
+    if lh.num_apps >= 1:
+      app = nv.struct_nvfw_hs_load_header_v2_app.from_buffer_copy(b, hs.header_offset + ctypes.sizeof(nv.struct_nvfw_hs_load_header_v2))
+      code_off, code_sz = app.offset, app.size
+    else:
+      # AD104 path: use os_code_offset/os_code_size as code, os_data_offset/os_data_size as data
+      code_off, code_sz = lh.os_code_offset, lh.os_code_size
 
     patch_loc, patch_sig = struct.unpack_from("<I", b, hs.patch_loc)[0], struct.unpack_from("<I", b, hs.patch_sig)[0]
     sig = b[(sig_off:=hs.sig_prod_offset + patch_sig):sig_off + (sig_len:=hs.sig_prod_size // struct.unpack_from("<I", b, hs.num_sig)[0])]
 
     (patched_image:=bytearray(b[h.data_offset:h.data_offset + h.data_size]))[patch_loc:patch_loc+sig_len] = sig
 
-    _, self.booter_image_paddr, _ = self.nvdev._alloc_boot_mem(len(patched_image), data=patched_image, sysmem=False)
-    self.booter_data_off, self.booter_data_sz, self.booter_code_off, self.booter_code_sz = lh.os_data_offset, lh.os_data_size, app.offset, app.size
+    _, self.booter_image_paddr, _ = self.nvdev._alloc_boot_mem(len(patched_image), data=patched_image, sysmem=(not self.nvdev.large_bar))
+    self.booter_data_off, self.booter_data_sz, self.booter_code_off, self.booter_code_sz = lh.os_data_offset, lh.os_data_size, code_off, code_sz
 
   def init_hw(self):
     self.falcon, self.sec2 = 0x00110000, 0x00840000
+
+    # Wait for Graphics Firmware Warm (GFW) boot to complete.
+    # On Ada (AD104+) GPUs, the VBIOS FWSEC must finish initializing
+    # before Falcon registers at BAR0+0x110000 are accessible.
+    # Poll BAR0+0x118234 until it reads 0xff.
+    wait_cond(lambda: (self.nvdev.rreg(0x118234) & 0xff) == 0xff,
+              timeout_ms=10000, msg="GFW boot timeout")
 
     self.reset(self.falcon)
     self.execute_hs(self.falcon, self.frts_image_paddr, code_off=0x0, data_off=self.desc_v3.IMEMLoadSize,
@@ -203,7 +218,7 @@ class NV_FLCN(NV_IP):
     self.reset(self.sec2)
     mbx = self.execute_hs(self.sec2, self.booter_image_paddr, code_off=self.booter_code_off, data_off=self.booter_data_off,
       imemPa=0x0, imemVa=self.booter_code_off, imemSz=self.booter_code_sz, dmemPa=0x0, dmemVa=0x0, dmemSz=self.booter_data_sz,
-      pkc_off=0x10, engid=1, ucodeid=3, mailbox=self.nvdev.gsp.wpr_meta_sysmem)
+      pkc_off=0x10, engid=1, ucodeid=3, mailbox=(self.nvdev.gsp.wpr_meta_paddr if self.nvdev.large_bar else self.nvdev.gsp.wpr_meta_sysmem))
     assert mbx[0] == 0x0, f"Booter failed to execute, mailbox is {mbx[0]:08x}, {mbx[1]:08x}"
 
     self.nvdev.NV_PFALCON_FALCON_OS.with_base(self.falcon).write(0x0)
@@ -236,8 +251,11 @@ class NV_FLCN(NV_IP):
   def execute_hs(self, base, img_paddr, code_off, data_off, imemPa, imemVa, imemSz, dmemPa, dmemVa, dmemSz, pkc_off, engid, ucodeid, mailbox=None):
     self.disable_ctx_req(base)
 
-    # target=0 is FB (not in published headers)
-    self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)[ctx_dma:=0].update(target=0, mem_type=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL)
+    # target=0 is FB (not in published headers); target=1 is COHERENT_SYSMEM.
+    # On small-BAR systems the booter image is in sysmem, so the Falcon
+    # has to DMA from system memory rather than from VRAM through the (too-small) BAR1 window.
+    target = 0 if self.nvdev.large_bar else self.nvdev.NV_PFALCON_FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM
+    self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)[ctx_dma:=0].update(target=target, mem_type=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL)
 
     cmd = self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).encode(write=0, size=self.nvdev.NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B,
       ctxdma=ctx_dma, imem=1, sec=1)
@@ -434,9 +452,16 @@ class NV_GSP(NV_IP):
     self.init_gsp_image()
     self.init_boot_binary_image()
 
-    common = {'sizeOfBootloader':(boot_sz:=len(self.booter_image)), 'sysmemAddrOfBootloader':self.booter_bar1,
-      'sizeOfRadix3Elf':(radix3_sz:=len(self.gsp_image)), 'sysmemAddrOfRadix3Elf': self.gsp_radix3_addrs[0],
-      'sizeOfSignature': 0x1000, 'sysmemAddrOfSignature': self.gsp_signature_bar1,
+    # The SEC2 booter uses FB DMA (target=0) on large-BAR systems, which interprets
+    # addresses as VRAM offsets (not GPAs). Convert BAR1 GPA addresses to VRAM offsets
+    # by subtracting the BAR1 base. On small-BAR systems the booter uses COHERENT_SYSMEM
+    # DMA (target=1) and expects raw GPA addresses.
+    bar1_base = self.nvdev.pci_dev.bar_info(1)[0]
+    def _boot_addr(gpa): return gpa - bar1_base if self.nvdev.large_bar else gpa
+
+    common = {'sizeOfBootloader':(boot_sz:=len(self.booter_image)), 'sysmemAddrOfBootloader':_boot_addr(self.booter_bar1),
+      'sizeOfRadix3Elf':(radix3_sz:=len(self.gsp_image)), 'sysmemAddrOfRadix3Elf': _boot_addr(self.gsp_radix3_addrs[0]),
+      'sizeOfSignature': 0x1000, 'sysmemAddrOfSignature': _boot_addr(self.gsp_signature_bar1),
       'bootloaderCodeOffset': self.booter_desc.monitorCodeOffset, 'bootloaderDataOffset': self.booter_desc.monitorDataOffset,
       'bootloaderManifestOffset': self.booter_desc.manifestOffset, 'revision':nv.GSP_FW_WPR_META_REVISION, 'magic':nv.GSP_FW_WPR_META_MAGIC}
 
@@ -450,7 +475,7 @@ class NV_GSP(NV_IP):
         gspFwHeapOffset=(gsp_heap_off:=round_down(gsp_off-gsp_heap_sz, 0x100000)), gspFwWprStart=(wpr_st:=round_down(gsp_heap_off-0x1000, 0x100000)),
         nonWprHeapSize=(non_wpr_sz:=0x100000), nonWprHeapOffset=(non_wpr_off:=round_down(wpr_st-non_wpr_sz, 0x100000)), gspFwRsvdStart=non_wpr_off)
       assert self.nvdev.flcn.frts_offset == m.frtsOffset, f"FRTS mismatch: {self.nvdev.flcn.frts_offset} != {m.frtsOffset}"
-    self.wpr_meta, _, wpr_meta_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(type(m)), data=bytes(m))
+    self.wpr_meta, self.wpr_meta_paddr, wpr_meta_addrs = self.nvdev._alloc_boot_mem(ctypes.sizeof(type(m)), data=bytes(m))
     self.wpr_meta_sysmem = wpr_meta_addrs[0]
 
   def promote_ctx(self, client:int, subdevice:int, obj:int, ctxbufs:dict[int, GRBufDesc], bufs=None, virt=None, phys=None):
